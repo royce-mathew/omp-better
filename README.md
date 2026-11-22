@@ -29,10 +29,11 @@ These environment variables must be available to the OMP process running the ext
 |---|---|
 | `/better <prompt>` | Research and deepen a prompt in a background helper. |
 | `/better` | Deepen the current task using the saved conversation. |
+| `/better-activity [next\|prev]` | Toggle the live activity view, or navigate its pages while the helper runs. |
 | `/better-cancel` | Stop the background helper. |
 | `/better-boomerang <prompt>` | Rewrite in the current chat, then return to the previous point and put the prompt in the editor. Omit the prompt to deepen the current task. |
 
-While `/better` runs, progress shows its current step and recent tools. Escape cancels the helper; a subsequent Escape can stop the main agent. Only one interactive helper runs at a time. When the rewrite is ready, anything already typed remains below it; nothing is sent automatically. In non-interactive modes, the result is posted instead of being placed in an editor.
+While `/better` runs, compact progress shows its current step and recent tools. Use `/better-activity` to expand or collapse a live view of recent commands, arguments and text results; use `/better-activity next` and `/better-activity prev` to navigate its pages. The view can expose sensitive information on screen and disappears when the helper finishes. Escape cancels the helper; a subsequent Escape can stop the main agent. Only one interactive helper runs at a time. When the rewrite is ready, anything already typed remains below it; nothing is sent automatically. In non-interactive modes, the result is posted instead of being placed in an editor.
 
 An agent can also start an OMP `task` brief with `/better` to have the brief checked against the project before the child starts. The check preserves the brief's scope and addresses gaps a child could not resolve on its own. OMP's 30-second tool-call handler timeout can prevent a longer brief check from completing. See [how it works](docs/how-it-works.md#subagent-briefs).
 

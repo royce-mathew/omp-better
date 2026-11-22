@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { isKeyRelease, isKittyProtocolActive, KeybindingsManager, setKeybindings, setKittyProtocolActive, stripTerminalSequences as plain, visibleWidth } from "@oh-my-pi/pi-tui";
+import { isKeyRelease, isKittyProtocolActive, KeybindingsManager, setKeybindings, setKittyProtocolActive, stripTerminalSequences as plain, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import extension, { HelperProgress } from "./index.ts";
 
 // A real helper run in a clone at /tmp/pb-rec/pi-better: four tools (bash and grep in parallel, the bash failed),
@@ -24,7 +24,7 @@ test("the /better widget keeps the same height and fits the width in every frame
 			for (const event of events) {
 				widget.apply(event);
 				frame = widget.render(width);
-				assert.equal(frame.length, 2, `${width} columns, ${event.type}`);
+				assert.equal(frame.length, 3, `${width} columns, ${event.type}`);
 				for (const line of frame) assert.ok(visibleWidth(line) <= width, `${width} columns: ${plain(line)}`);
 				shown.add(plain(frame[0]).slice(9).replace(/ +19m 59s.*/, ""));
 			}
@@ -75,6 +75,42 @@ test("each tool shows as one short line: the real command or path, shortened to 
 	}
 });
 
+test("expanded activity shows full tool arguments and live results without terminal controls", () => {
+	const widget = new HelperProgress({ requestRender() {}, requestComponentRender() {} } as unknown as TUI, theme, ["/project"], Date.now());
+	try {
+		widget.apply({ type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: { command: "cd /project && cat src/example.ts" } });
+		widget.apply({ type: "tool_execution_update", toolCallId: "1", toolName: "bash", args: {}, partialResult: { content: [{ type: "text", text: "first \x1b[31mred\x1b[0m\n\x1b]0;bad\x07second" }] } });
+		assert.match(plain(widget.render(80).join("\n")), /\/better-activity shows live activity/);
+		widget.toggleActivity();
+		const live = widget.render(80).join("\n");
+		assert.match(plain(live), /cd \/project && cat src\/example\.ts/);
+		assert.match(plain(live), /first red\n   second/);
+		assert.doesNotMatch(live, /\x1b\]0;bad/);
+		widget.apply({ type: "tool_execution_end", toolCallId: "1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "finished" }] } });
+		assert.match(plain(widget.render(80).join("\n")), /done: bash[\s\S]*result:\n   finished/);
+		widget.toggleActivity();
+		assert.doesNotMatch(plain(widget.render(80).join("\n")), /finished/);
+	} finally {
+		widget.dispose();
+	}
+});
+
+test("activity pages retain bounded output and visibly mark truncation", () => {
+	const widget = new HelperProgress({ requestRender() {}, requestComponentRender() {} } as unknown as TUI, theme, [], Date.now());
+	try {
+		widget.apply({ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { path: "/project/long.txt" } });
+		widget.apply({ type: "tool_execution_end", toolCallId: "1", toolName: "read", isError: false, result: { content: [{ type: "text", text: Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n") + "\n" + "x".repeat(2100) }] } });
+		widget.toggleActivity();
+		assert.match(plain(widget.render(80).join("\n")), /Activity 1\/[2-9][\s\S]*\/project\/long\.txt[\s\S]*line 1/);
+		widget.moveActivity(100);
+		assert.match(plain(widget.render(80).join("\n")), /\[truncated\]/);
+		widget.moveActivity(-100);
+		assert.match(plain(widget.render(80).join("\n")), /Activity 1\/[2-9]/);
+	} finally {
+		widget.dispose();
+	}
+});
+
 // Runs `body` with the helper replaced by fixtures/fake-pi.mjs, which replies once the gate file exists (or after 5 s),
 // and with `dir` as the temp folder, where pi-better puts the helper's copy of the session.
 async function withFakeHelper(body: (setup: { dir: string; session: string; gate: string }) => Promise<void>): Promise<void> {
@@ -97,6 +133,38 @@ async function withFakeHelper(body: (setup: { dir: string; session: string; gate
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
+
+test("/better-activity toggles the running helper's view and reports when unavailable", { timeout: 10_000 }, () =>
+	withFakeHelper(async ({ dir, session, gate }) => {
+		const commands: Record<string, { handler: (args: string, ctx: unknown) => Promise<void> }> = {};
+		extension({ registerCommand: (name: string, command: typeof commands[string]) => (commands[name] = command), on() {}, getSettings: () => ({}), appendEntry() {}, sendMessage() {} } as unknown as Parameters<typeof extension>[0]);
+		let widget: HelperProgress | undefined;
+		let notice = "";
+		const finished = Promise.withResolvers<void>();
+		const tui = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
+		const ui = {
+			setWidget: (_key: string, factory?: (ui: TUI, widgetTheme: typeof theme) => HelperProgress) => {
+				widget?.dispose();
+				widget = factory?.(tui, theme);
+			},
+			onTerminalInput: () => () => {},
+			notify: (message: string) => { notice = message; },
+			getEditorText: () => "",
+			setEditorText: () => finished.resolve(),
+		};
+		const ctx = { hasUI: true, mode: "tui", cwd: dir, isIdle: () => false, sessionManager: { getSessionFile: () => session }, ui };
+		await commands["better-activity"].handler("", ctx);
+		assert.equal(notice, "No /better activity is available.");
+		await commands.better.handler("add a name flag", ctx);
+		assert.match(plain(widget!.render(80).join("\n")), /shows live activity/);
+		await commands["better-activity"].handler("", ctx);
+		assert.match(plain(widget!.render(80).join("\n")), /Activity 1\/1/);
+		await commands["better-activity"].handler("", ctx);
+		assert.match(plain(widget!.render(80).join("\n")), /shows live activity/);
+		writeFileSync(gate, "");
+		await finished.promise;
+	}),
+);
 
 test("/better returns at once while the agent is busy, and its prompt lands above the draft before the agent is idle", { timeout: 10_000 }, () =>
 	withFakeHelper(async ({ dir, session, gate }) => {

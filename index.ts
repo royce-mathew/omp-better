@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, AgentSessionEvent, SessionEntry, SessionHeader, Theme } from "@oh-my-pi/pi-coding-agent";
-import { getKeybindings, isKeyRelease, Loader, type TUI, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { getKeybindings, isKeyRelease, Loader, stripTerminalSequences, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
 import { BRIEF_MARK, buildBriefTask, buildHelperTask, HELPER_ENV, helperExitError, helperModelArgs, helperToolBlock, parseMarkedPrompt, replyProgress } from "./better.ts";
 
 const HELPER_TIMEOUT_MS = 20 * 60 * 1000;
@@ -128,30 +128,67 @@ function toolLabel(name: string, args: any, projectDirs: readonly string[]): str
 	return label.replace(/[\s\x00-\x1f\x7f]+/g, " ").trim() || name;
 }
 
+function activityText(value: unknown): string {
+	const text = typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "";
+	const safe = stripTerminalSequences(text).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ");
+	return safe.length > 2000 ? `${safe.slice(0, 2000)}\n[truncated]` : safe;
+}
+
+function resultText(result: unknown): string {
+	if (result && typeof result === "object" && "content" in result && Array.isArray(result.content)) {
+		return result.content.flatMap((part: unknown) => part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string" ? [part.text] : []).join("\n");
+	}
+	return result === undefined ? "" : activityText(result);
+}
+
 // One per question, in helper.md's order.
 const ANSWERING = ["Working out what a pro would do", "Finding the rawest material", "Picking the methods and tools", "Deciding what would prove it right"];
 
 // Loader's timer, which pulses the meter's current cell, also repaints the clock.
 export class HelperProgress extends Loader {
 	private readonly theme: Theme;
+	private readonly ui: TUI;
 	private readonly projectDirs: readonly string[];
 	private readonly startedAt: number;
-	private readonly tools: { id: string; label: string; state: "running" | "ok" | "failed" }[] = [];
+	private readonly tools: { id: string; label: string; details: string; result: string; state: "running" | "ok" | "failed" }[] = [];
+	private toolCount = 0;
+	private failedCount = 0;
+	private activityPage = 0;
+	private expanded = false;
 	private reply = "";
 
 	constructor(tui: TUI, theme: Theme, projectDirs: readonly string[], startedAt: number) {
 		super(tui, (cell) => cell, (message) => message, "", ["▰", "▱"]);
+		this.ui = tui;
 		this.theme = theme;
 		this.projectDirs = projectDirs;
 		this.startedAt = startedAt;
 	}
 
+	toggleActivity(): void {
+		this.expanded = !this.expanded;
+		this.ui.requestRender();
+	}
+
+	moveActivity(direction: number): void {
+		this.expanded = true;
+		this.activityPage = Math.max(0, this.activityPage + direction);
+		this.ui.requestRender();
+	}
+
 	apply(event: HelperEvent): void {
 		if (event.type === "tool_execution_start") {
-			this.tools.push({ id: event.toolCallId, label: toolLabel(event.toolName, event.args, this.projectDirs), state: "running" });
-		} else if (event.type === "tool_execution_end") {
+			this.toolCount++;
+			this.tools.push({ id: event.toolCallId, label: activityText(toolLabel(event.toolName, event.args, this.projectDirs)), details: activityText(`${event.toolName} ${JSON.stringify(event.args, null, 2)}`), result: "", state: "running" });
+			if (this.tools.length > 50) this.tools.shift();
+		} else if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
 			const tool = this.tools.find((candidate) => candidate.id === event.toolCallId);
-			if (tool) tool.state = event.isError ? "failed" : "ok";
+			if (tool) {
+				const result = resultText(event.type === "tool_execution_update" ? event.partialResult : event.result);
+				if (result) tool.result = activityText(result);
+				if (event.type === "tool_execution_end") tool.state = event.isError ? "failed" : "ok";
+			}
+			if (event.type === "tool_execution_end" && event.isError) this.failedCount++;
 		} else if (event.type === "message_start" && event.message.role === "assistant") {
 			this.reply = "";
 		} else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -181,8 +218,7 @@ export class HelperProgress extends Loader {
 		const left = visibleWidth(meter + full) <= room ? meter + full : truncateToWidth(meter + short, room);
 		const top = left + " ".repeat(Math.max(1, room + 1 - visibleWidth(left))) + right;
 
-		const failed = this.tools.filter((tool) => tool.state === "failed").length;
-		const count = `${this.tools.length} tool${this.tools.length === 1 ? "" : "s"}${failed ? ` · ${failed} failed` : ""}`;
+		const count = `${this.toolCount} tool${this.toolCount === 1 ? "" : "s"}${this.failedCount ? ` · ${this.failedCount} failed` : ""}`;
 		const chip = ({ label, state }: (typeof this.tools)[number]) => {
 			const text = truncateToWidth(label, 28);
 			if (state === "running") return `${theme.fg("muted", "•")} ${text}`;
@@ -200,7 +236,18 @@ export class HelperProgress extends Loader {
 			const trail = shown.length ? shown.join("  ") : truncateToWidth(chip(this.tools.at(-1)!), Math.max(space, 0));
 			bottom = `   ${trail}${" ".repeat(Math.max(1, space + 2 - visibleWidth(trail)))}${theme.fg("dim", count)} `;
 		}
-		return [truncateToWidth(top, width), truncateToWidth(bottom, width)];
+		const hint = `   /better-activity ${this.expanded ? "hides · /better-activity next/prev pages" : "shows live activity"}`;
+		if (!this.expanded) return [truncateToWidth(top, width), truncateToWidth(bottom, width), truncateToWidth(theme.fg("dim", hint), width)];
+		const lines = this.tools.flatMap((tool) => {
+			const status = tool.state === "running" ? "running" : tool.state === "failed" ? "failed" : "done";
+			const text = `${status}: ${tool.details}${tool.result ? `\nresult:\n${tool.result}` : ""}`;
+			return text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", Math.max(1, width - 3)).map((part) => `   ${part}`));
+		});
+		const pages = Math.max(1, Math.ceil(lines.length / 12));
+		this.activityPage = Math.min(this.activityPage, pages - 1);
+		const visible = lines.slice(this.activityPage * 12, (this.activityPage + 1) * 12);
+		const page = `   Activity ${this.activityPage + 1}/${pages}${this.toolCount > this.tools.length ? " · earlier tools truncated" : ""}`;
+		return [truncateToWidth(top, width), truncateToWidth(bottom, width), truncateToWidth(theme.fg("dim", hint), width), truncateToWidth(theme.fg("dim", page), width), ...visible.map((line) => truncateToWidth(line, width))];
 	}
 
 	dispose(): void {
@@ -243,6 +290,7 @@ export default function (pi: ExtensionAPI) {
 	const helper = () => readFileSync(new URL("./helper.md", import.meta.url), "utf8");
 	const briefCheck = () => readFileSync(new URL("./brief.md", import.meta.url), "utf8");
 	let helperRun: AbortController | undefined;
+	let helperWidget: HelperProgress | undefined;
 	// Aborted on session_shutdown: Pi exits or loads a fresh copy of this extension after it, and a helper still
 	// checking a brief would outlive the session.
 	let briefRuns = new AbortController();
@@ -338,7 +386,7 @@ export default function (pi: ExtensionAPI) {
 				let tui: TUI | undefined;
 				ctx.ui.setWidget(WIDGET, (ui, theme) => {
 					tui = ui;
-					return (widget = new HelperProgress(ui, theme, projectDirs, startedAt));
+					return (helperWidget = widget = new HelperProgress(ui, theme, projectDirs, startedAt));
 				});
 				// The first Esc Pi's input box passes on cancels /better; after that, Esc is Pi's again (stopping the agent,
 				// clearing a "!" line, and so on).
@@ -386,12 +434,28 @@ export default function (pi: ExtensionAPI) {
 					else failed(ctx, "better", error);
 				} finally {
 					helperRun = undefined;
+					helperWidget = undefined;
 					stopListening?.();
 					if (run.signal.reason !== SHUTDOWN) ctx.ui.setWidget(WIDGET, undefined);
 				}
 			})();
 			// Print and JSON mode exit once the command returns, so only the TUI and RPC run in the background.
 			if (!ctx.hasUI) await finished;
+		},
+	});
+
+	pi.registerCommand("better-activity", {
+		description: "Toggle live /better activity, or use next/prev to page through it",
+		handler: async (args, ctx) => {
+			if (!helperRun || !helperWidget) {
+				ctx.ui.notify("No /better activity is available.", "info");
+				return;
+			}
+			const action = args.trim();
+			if (!action) helperWidget.toggleActivity();
+			else if (action === "next") helperWidget.moveActivity(1);
+			else if (action === "prev") helperWidget.moveActivity(-1);
+			else ctx.ui.notify("Use /better-activity, /better-activity next, or /better-activity prev.", "info");
 		},
 	});
 

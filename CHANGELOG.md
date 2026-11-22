@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `/better-activity` to inspect the helper's live tool calls and results.
 - Ported the extension to OMP, using the `@smol` model role for background rewrites.
 - Added OMP task-brief support and documented the helper's unsandboxed shell.
 
