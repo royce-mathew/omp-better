@@ -1,19 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-// Pi's loader supplies its own pi-tui at runtime; outside Pi, use the global install like tsconfig.json does.
-const PI_PACKAGES = "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works";
-registerHooks({
-	resolve: (specifier, context, next) =>
-		next(specifier.startsWith("@earendil-works/") ? pathToFileURL(`${PI_PACKAGES}/${specifier.slice(16)}/dist/index.js`).href : specifier, context),
-});
-const { isKeyRelease, KeybindingsManager, setKeybindings, stripTerminalSequences: plain, visibleWidth } = await import("@earendil-works/pi-tui");
-const { default: extension, HelperProgress } = await import("./index.ts");
+import { isKeyRelease, isKittyProtocolActive, KeybindingsManager, setKeybindings, setKittyProtocolActive, stripTerminalSequences as plain, visibleWidth } from "@oh-my-pi/pi-tui";
+import extension, { HelperProgress } from "./index.ts";
 
 // A real helper run in a clone at /tmp/pb-rec/pi-better: four tools (bash and grep in parallel, the bash failed),
 // then answers (1) to (4) and the prompt. Payloads are trimmed; every event is kept, in order.
@@ -24,7 +17,7 @@ const theme = { fg: (role: string, text: string) => `\x1b[${colors[role]}m${text
 test("the /better widget keeps the same height and fits the width in every frame of a real run", () => {
 	for (const width of [50, 80, 120, 200]) {
 		// 19m 59s in: the widest clock before the 20-minute timeout.
-		const widget = new HelperProgress({ requestRender() {} } as any, theme, ["/tmp/pb-rec/pi-better", "/private/tmp/pb-rec/pi-better"], Date.now() - 1_199_000);
+		const widget = new HelperProgress({ requestRender() {}, requestComponentRender() {} } as any, theme, ["/tmp/pb-rec/pi-better", "/private/tmp/pb-rec/pi-better"], Date.now() - 1_199_000);
 		try {
 			let frame: string[] = [];
 			const shown = new Set<string>();
@@ -71,7 +64,7 @@ test("each tool shows as one short line: the real command or path, shortened to 
 		["grep", { pattern: "a\nb\tc", path: project }, "grep a b c"],
 	];
 	for (const [toolName, args, label] of cases) {
-		const widget = new HelperProgress({ requestRender() {} } as any, theme, [project], Date.now());
+		const widget = new HelperProgress({ requestRender() {}, requestComponentRender() {} } as any, theme, [project], Date.now());
 		try {
 			widget.apply({ type: "tool_execution_start", toolCallId: "1", toolName, args });
 			const tools = plain(widget.render(200)[1]);
@@ -134,8 +127,8 @@ test("the first Esc cancels /better even while the agent is busy, and the next E
 		extension({ registerCommand: (name: string, command: any) => (commands[name] = command), on() {}, getSettings: () => ({}), appendEntry: (type: string) => entries.push(type) } as any);
 		// Every key this test presses is Esc, which Pi's editor passes to its app-level handler (stopping the agent's run).
 		let piEscapes = 0;
-		const editor = { actionHandlers: new Map(), onEscape: () => piEscapes++, handleInput() { this.onEscape(); } };
-		const tui = { getFocusedComponent: () => editor, requestRender() {} };
+		const editor = { setText() {}, onEscape: () => piEscapes++, handleInput() { this.onEscape(); } };
+		const tui = { getFocused: () => editor, requestRender() {}, requestComponentRender() {} };
 		let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
 		// Like Pi's TUI: the input listeners see each key first, then the focused component gets it, minus key releases.
 		const press = (data: string) => {
@@ -158,12 +151,15 @@ test("the first Esc cancels /better even while the agent is busy, and the next E
 		const ctx = { hasUI: true, mode: "tui", cwd: dir, model: { provider: "p", id: "m" }, thinkingLevel: "low", isIdle: () => false, sessionManager: { getSessionFile: () => session }, ui };
 
 		await commands.better.handler("add a name flag", ctx);
-		const copies = () => readdirSync(dir).filter((name) => name.startsWith("pi-better-"));
+		const copies = () => readdirSync(dir).filter((name) => name.startsWith("omp-better-"));
 		assert.equal(copies().length, 1, "the helper works on a copy of the session");
+		const kittyWasActive = isKittyProtocolActive();
+		setKittyProtocolActive(true);
 		// Esc pressed twice fast in a Kitty terminal: press, release and press arrive in one chunk.
 		press("\x1b[27u");
 		press("\x1b[27;1:3u");
 		press("\x1b[27u");
+		setKittyProtocolActive(kittyWasActive);
 		assert.equal(piEscapes, 1, "the second Esc stops the agent");
 		// When Pi quits mid-run, it exits before the helper does, so the copy can't wait for the helper's exit.
 		assert.deepEqual(copies(), [], "the copy is deleted as soon as /better is cancelled");

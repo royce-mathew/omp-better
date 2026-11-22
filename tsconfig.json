@@ -1,5 +1,4 @@
 {
-  // Type-check only. Pi loads index.ts with its own loader; the paths point the Pi imports at the global install.
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
@@ -8,12 +7,7 @@
     "noEmit": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "types": ["node"],
-    "typeRoots": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@types"],
-    "paths": {
-      "@earendil-works/pi-coding-agent": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
-      "@earendil-works/*": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/*/dist/index.d.ts"]
-    }
+    "types": ["node"]
   },
   "include": ["*.ts"]
 }

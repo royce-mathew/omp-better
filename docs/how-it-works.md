@@ -1,110 +1,39 @@
-# How pi-better works
+# How omp-better works
 
-Both commands send the same task: [helper.md](../helper.md) (Felix Rieseberg's "Depth" prompt, opened with an instruction to read the code and files first without asking, plus how to keep searches quick), then the prompt to deepen, then a request to end the reply with the rewritten prompt between `<improved-prompt>` and `</improved-prompt>`. They differ in who answers it.
-
-```text
-/better <prompt>                                 /better-boomerang <prompt>
-      │                                                │
-      ▼                                                ▼
-separate `pi -p` process, in the background      this chat answers, as a hidden message
- · copy of this chat as of /better               (you watch it read and write)
- · read-only: tools other than reading are refused     │
- · the chat's model and thinking, 20-minute limit      ▼
-      │                                          the chat jumps back to where it was
-      ▼                                          before; the rewrite stays in /tree
-      └──────────────┬─────────────────────────────────┘
-                     ▼
-     the prompt in the last <improved-prompt> block goes into your input box,
-     above anything you'd typed; nothing is sent until you press Enter
-```
+Both commands send [helper.md](../helper.md), a version of Felix Rieseberg's Depth prompt that first asks the model to inspect relevant material and not do the task. The response ends with the rewritten prompt between `<improved-prompt>` and `</improved-prompt>`. The last marked block supplies the result.
 
 ## `/better`
 
-**The helper is its own Pi process.** pi-better runs `pi --mode json -p` with the chat's `--model` and `--thinking` level. It loads your usual extensions, skills and settings, and `--fork` brings back the chat's tool list, so it sends the same tools and system prompt as the chat (unless the chat was started with flags that change them; see Limitations). It's launched the same way as Pi's own subagent example: the CLI script of the Pi you're running, the Pi binary itself when Pi is a compiled binary, or `pi` from your PATH.
+The extension starts a separate OMP process in the background. When the current session has been saved, the helper forks it into a temporary session directory; otherwise it starts fresh and needs an explicit prompt. Messages sent after the fork are not included. The temporary session is removed after the helper finishes or is cancelled.
 
-**It reuses the chat's prompt cache.** Providers cache a request's opening (tools, then system prompt, then messages) and match it exactly, so the helper changes nothing before its own task message. Measured on `pi-claude/claude-opus-5-5`, same thinking level, run back to back:
+The helper defaults to the `@smol` model role, rather than the current chat's model. Set `BETTER_MODEL` to select another model and `BETTER_THINKING` to select a thinking level. The helper inherits environment variables from the OMP process. Because its model may differ from the chat's, do not assume it reuses the chat's prompt cache.
 
-| Input tokens | read from cache | written to cache |
-|---|---|---|
-| the chat's turn | 21,247 | 16,030 |
-| helper with its own tool list and system prompt (before) | 1,651 | 17,135 |
-| helper with the chat's (now) | 36,860 | 1,352 |
+The helper loads OMP's normal extensions and settings and explicitly loads omp-better for its tool-call restrictions. Session-start effects of other extensions may also occur in the helper.
 
-`"better": { "model": "…", "thinking": "…" }` in `settings.json` pins either one for the helper instead, at the cost of the cache.
+The helper is instructed to read and rewrite without performing the requested work. Its extension blocks calls to tools other than `read`, `grep`, `glob`, `find`, and `bash`. **This is not a sandbox:** bash can write files, execute commands and otherwise change the environment. Prompt instructions and tool-call filtering are not a security boundary.
 
-**It can only read.** Narrowing the helper's tool list can change the start of its request (for most models Pi puts tool changes into the opening system prompt), so it keeps every tool and pi-better refuses the calls instead: the helper process runs with `PI_BETTER_HELPER=1`, and pi-better's copy inside it blocks any tool other than `read`, `grep`, `find`, `ls` and the shell (`bash`, or `powershell` where your setup uses it), telling the model which of those it has. Pi turns on only `read` and `bash` of these by default; `grep`, `find` and `ls` are there when your chat has them.
+Progress displays a six-step meter based on the numbered answers and the marked prompt, along with recent tool calls. On success, the full reply is saved as a `better` session entry and the extracted prompt is placed in the editor above any existing draft. The user must send it. In print, JSON and RPC modes, where an editor draft cannot safely be preserved, the result is posted instead; print and JSON mode wait for the helper.
 
-**It gets a copy of your chat, as it was when you ran `/better`.** If the session has been saved (it has once there's a message in it), the helper starts with `--fork` of the session file. The copy goes into a temporary folder that's deleted when the helper finishes, or right away when `/better` is cancelled or you quit Pi, so it never shows up in `/resume` or stays on disk. Messages you send while it works don't reach it. In a new session with nothing saved yet, it starts fresh, so `/better` needs a prompt there.
-
-**It runs in the background.** `/better` returns right away and you keep chatting. The two progress rows come from the helper's JSON event stream. Tool start and end events fill the second row: each tool shows as its first real command or its path, inside the project, under `~`, or as a bare file name, with ✓ or ✗, newest last, oldest dropped when the row is full. The reply's text sets the first row, a six-cell meter and what the helper is doing: "Reading your code and files" until the reply starts a line with "(n)", then what it is working out for that question, like "Picking the methods and tools (3 of 4)", then "Writing your improved prompt" once the `<improved-prompt>` line opens. Each step fills one more cell. Both rows stay the same height and are cut to the terminal's width; when the full wording doesn't fit, a short form shows ("Reading files", "Thinking", "Writing prompt"). The meter's timer pulses the current cell and also repaints the clock.
-
-When the helper exits, pi-better takes the text of its last reply, reads the prompt out of the last `<improved-prompt>` block, saves the whole reply as a `better` session entry that the model never sees, and puts the prompt in your input box.
-
-**It works while the agent is busy.** Pi runs a slash command from an extension as soon as you press Enter, even while the agent is writing a reply, running a tool or compacting; a normal message sent then waits in the queue. So `/better` starts its helper right away, and the improved prompt lands in your input box while the agent keeps working. The copy holds every message saved so far. Pi saves a message when it finishes, so a reply still being written isn't in it, and a tool call still running has no result yet; Pi fills in a "No result provided" result when it sends the copy to the model. In a new session, Pi saves the file as soon as your first message starts the turn, so `/better` with no prompt works during that first turn too.
-
-**One at a time.** A second `/better` while one is running is refused. Esc stops the helper, and so does starting or switching sessions (`/new`, `/resume`, `/reload`); after a session switch, the stopped run doesn't touch the old session.
-
-**The first Esc stops it.** While `/better` runs, the first Esc goes to `/better`, even while the agent is busy, and the next Esc does what it always does in Pi: stops the agent's run or a `!` command, or clears a `!` line. Pi reserves Esc, so an extension can't register it as a shortcut. Instead pi-better watches keys as they come in, and for one Esc it points the input box's app-level Esc handler at `/better`. The input box still gets the key first, so Esc that closes autocomplete, or leaves insert mode in a vim-style editor, does that and nothing else, and a picker or dialog in focus keeps its Esc. Two Esc presses that reach Pi together still split this way: the first stops `/better`, the second the agent.
-
-`/better-cancel` also stops the helper. It's there for RPC mode, which has no Esc key.
+Only one interactive `/better` runs at a time. Escape or `/better-cancel` stops it; switching sessions or shutting down also cancels it. The helper has a 20-minute limit. If its response is missing the marked block or the block is empty, the response is retained and an error identifies where to find it.
 
 ## `/better-boomerang`
 
-The agent in this chat answers the same task, as a hidden message that starts a turn. It can read and run commands like any turn, but it's told only to read and rewrite. When the turn ends, pi-better reads the prompt from the reply, jumps the chat back to the entry before the rewrite with Pi's tree navigation (no summary), and puts the prompt in your input box. The rewrite turn leaves the chat's context but stays in `/tree`.
+The current chat answers the same Depth task as a hidden message. Once the turn ends, the extension extracts the prompt and navigates back to the prior session entry without a summary. The rewrite remains reachable in the session tree, while the prompt is handed back to the user. If the rewrite cannot be parsed or the jump is cancelled, the rewrite remains available in the chat.
 
-If the chat's last entry is a message (yours or one an extension added), pi-better first adds an invisible marker entry to jump back to, because jumping to a message would put its text back into your input box.
+Unlike `/better`, this uses the current chat's model, tools and permissions; the helper's tool restrictions do not apply. The model is instructed to research and rewrite rather than implement, but that instruction does not enforce read-only behavior.
 
 ## Subagent briefs
 
-An agent can use `/better` the way you do: it starts a [pi-subagents](https://github.com/nicobailon/pi-subagents) task with `/better`, and the subagent gets the checked brief. pi-better doesn't tell the agent about this, so its prompt cache stays the same; say it where your agent reads instructions, such as AGENTS.md or a skill. pi-better watches each single `subagent` call and each `subagent_launch` call, which pi-subagents makes for every child a workflow starts (workflow scripts, `parallel`, `tasks` and `chain`, with `{previous}` already filled in). It needs a pi-subagents version that applies a changed `task`; older ones start the child with the literal `/better …` text.
+When an OMP `task` call starts a brief with `/better`, the extension checks the brief before starting the child, for both single and batch calls. [brief.md](../brief.md) asks the helper to read the brief from the child's perspective, check relevant paths and commands, and fill gaps without expanding the assigned scope. A brief that needs no changes can be returned unchanged.
 
-A brief gets a different prompt from yours, [brief.md](../brief.md). An agent's brief is usually long and its scope is decided, so instead of deepening it, the same kind of helper reads it as the subagent will, with none of the chat. It lists what the subagent can't resolve on its own, checks every path, name and command against the repo, finds how the subagent will know it's done, and fixes only those gaps. A brief that needs nothing comes back unchanged. The helper runs in the subagent's folder, and the status bar counts the briefs being checked. Esc, an error or the 20-minute limit stops that subagent from starting.
+The check runs in the child's working directory and uses the same helper model and tool restrictions as `/better`. If the check is cancelled, times out or fails, the affected child is not started with an unchecked brief. The status shows how many briefs are being checked.
 
-## Outside the interactive terminal
-
-Print and JSON mode have no input box, and in RPC mode pi-better can't read what's already in the box, so a draft would be lost. In those modes `/better` posts the helper's whole reply as a message and `/better-boomerang` posts the prompt. In print and JSON mode `/better` waits for the helper before the command returns, since Pi would exit otherwise.
-
-## The prompt cache
-
-Neither command changes earlier history, and your conversation only gains the message you send, so the prompt cache stays warm. `/better-boomerang` costs one extra turn on top of the cached history. `/better`'s helper sends the same opening as the chat, so it reads the chat's cached history too (see [`/better`](#better)), unless `settings.json` gives it a different model or thinking level.
-
-## Error messages
-
-| Message | What it means |
-|---|---|
-| `/better has no task to deepen yet; give it a prompt: /better <prompt>` | nothing has been saved in this session yet, so there's no task to deepen |
-| `/better is already running; escape stops it.` | one helper runs at a time (in RPC mode it names `/better-cancel`) |
-| `/better failed: No model is selected; pick one with /model.` | the chat has no model yet, so the helper has none to use |
-| `/better failed: "better" in settings.json must be an object like …` | `better` in `settings.json` isn't `{ "model": …, "thinking": … }` |
-| `/better failed: "better.model" in settings.json must be a string like …` | `better.model` is empty or not a string |
-| `/better failed: "better.thinking" in settings.json must be one of …` | `better.thinking` isn't one of Pi's thinking levels |
-| `/better cancelled; nothing was sent` | you pressed Esc or ran `/better-cancel` |
-| `No /better is running.` | `/better-cancel` had nothing to stop |
-| `/better failed: Couldn't start pi for the helper: …` | the `pi` command couldn't be launched |
-| `/better failed: The helper timed out after 20 minutes` | the helper hit its limit; try a narrower prompt |
-| `/better failed: The helper exited with code …` | the text after it is the end of the helper's error output, for example an unknown model |
-| `/better failed: The helper exited with code … without printing an error` | the helper stopped with no error output; code 143 means something sent it SIGTERM |
-| `/better failed: The helper was stopped by …` | something outside pi-better killed the helper with that signal, for example `SIGKILL` |
-| `/better failed: The helper finished without replying` | the helper exited normally but wrote no reply text; run the command again |
-| `/better failed: The helper's model call failed: …` | the model returned an error, for example a rate limit or a sign-in problem |
-| `/better failed: The reply has no <improved-prompt> … </improved-prompt> block. The helper's whole reply is in …` | the reply ended without the marked prompt; open the file named at the end to see what the helper wrote, then run the command again |
-| `/better failed: The reply's <improved-prompt> block is empty. The helper's whole reply is in …` | same, with an empty block |
-| `/better-boomerang is already running; wait for it to finish.` | one boomerang at a time |
-| `/better-boomerang has no task to deepen yet; give it a prompt: /better-boomerang <prompt>` | this chat has no entries yet, so there's no task to deepen |
-| `/better-boomerang failed: another extension cancelled the jump back to where the rewrite started` | another extension blocked the tree navigation; the rewrite is still in the chat |
-| `/better-boomerang failed: the rewrite's branch point is gone from the session` | the chat moved off the rewrite's branch during the turn; the rewrite is still in the session |
-| `/better was cancelled, so the subagent didn't start.` | Esc or quitting stopped a brief check; for a workflow child it follows `Workflow child '<key>' was not started: …` |
-| `/better couldn't check this subagent brief, so the subagent didn't start: …` | the helper failed on a brief; the text after it is one of the `/better failed:` reasons above |
-| `A /better subagent brief needs the brief after /better.` | the task was `/better` with nothing after it |
-
-`/better` also saves that reply as a `better` session entry. `/better-boomerang` reports a missing or empty block without the file part, and leaves the rewrite in the chat so you can see what happened.
+OMP limits tool-call handlers to 30 seconds, so a brief check that takes longer can time out before the helper's own 20-minute limit.
 
 ## Limitations
 
-- The helper can't ask you questions while it works, so it decides from what it can read.
-- The helper keeps its shell (`bash`, or `powershell`) so it can run read-only searches and quick experiments. A shell command could still write a file; only [helper.md](../helper.md) tells it not to.
-- The refusal comes from pi-better's copy inside the helper, so it needs pi-better installed where Pi finds it on its own (`~/.pi/agent/extensions` or `pi install`). Loaded only with `-e` for one chat, the helper won't have it, and only helper.md keeps it from editing.
-- The helper gets your settings, not the flags the chat was started with. A chat started with `--append-system-prompt`, `-e`, `--no-context-files` or similar flags sends a different opening, so the helper's request misses the cache.
-- The helper loads your usual extensions, so any extension that does something at session start does it once per helper too.
-- A workflow that starts several `/better` subagents at once runs one helper per brief, each with its own copy of the chat. A workflow's own stop or time limit doesn't stop a helper that's already checking a brief; only Esc on the turn, or quitting, does. The subagent still never starts. The check's time counts against the workflow's time limit.
-- Some starts get the literal `/better …` text, because pi-subagents doesn't offer them to other extensions: workflows started inside a subagent, chats whose `--tools` list leaves `subagent_launch` out, schedule ticks, auto-resume, RPC starts and prompt-template delegation. A background subagent that itself calls `subagent` with a `/better` task fails to start, because the helper can't be launched from pi-subagents' background runner. Extensions that approve subagent starts and load before pi-better see the brief before it's checked.
+- The helper cannot ask questions interactively; it works from the prompt, copied session and available material.
+- Its shell is not sandboxed, and the boomerang command has the current chat's permissions.
+- The helper gets its own OMP process configuration, not necessarily every flag passed to the parent.
+- A saved-session copy reflects the session at the time the helper starts, not messages that arrive later.
+- Running several brief checks can start several helpers; each consumes its own model and tool resources.

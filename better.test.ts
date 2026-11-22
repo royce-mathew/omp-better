@@ -26,20 +26,15 @@ test("helperExitError names the signal or code, and never ends on a bare colon",
 	assert.equal(helperExitError(1, null, "a\nb\nc\nError: unknown model\n"), "The helper exited with code 1: b c Error: unknown model");
 });
 
-test("the helper runs on the chat's model and thinking level unless settings pin them", () => {
-	assert.deepEqual(helperModelArgs(undefined, "pi-claude/claude-opus-5-5", "medium"), ["--model", "pi-claude/claude-opus-5-5", "--thinking", "medium"]);
-	assert.deepEqual(helperModelArgs({ model: "anthropic/claude-opus-4-5", thinking: "high" }, "openai/gpt-5", "low"), ["--model", "anthropic/claude-opus-4-5", "--thinking", "high"]);
-	assert.deepEqual(helperModelArgs({ thinking: "high" }, "openai/gpt-5", "low"), ["--model", "openai/gpt-5", "--thinking", "high"]);
-	assert.deepEqual(helperModelArgs(undefined, "openai/gpt-5", undefined), ["--model", "openai/gpt-5"]);
-	assert.throws(() => helperModelArgs(undefined, undefined, undefined), /pick one with \/model/);
-	assert.throws(() => helperModelArgs({ model: 5 }, "openai/gpt-5", "low"), /"better.model" in settings.json must be a string/);
-	assert.throws(() => helperModelArgs("opus", "openai/gpt-5", "low"), /"better" in settings.json must be an object/);
-	assert.throws(() => helperModelArgs(["x/y"], "openai/gpt-5", "low"), /"better" in settings.json must be an object/);
-	assert.throws(() => helperModelArgs({ thinking: "hihg" }, "openai/gpt-5", "low"), /"better.thinking" in settings.json must be one of off, minimal/);
+test("the helper defaults to the smol role and accepts model and thinking overrides", () => {
+	assert.deepEqual(helperModelArgs(undefined, "openai/gpt-5", "medium"), ["--model", "@smol"]);
+	assert.deepEqual(helperModelArgs({ model: "provider/model", thinking: "low" }, undefined, undefined), ["--model", "provider/model", "--thinking", "low"]);
+	assert.throws(() => helperModelArgs({ model: "" }, undefined, undefined), /BETTER_MODEL/);
+	assert.throws(() => helperModelArgs({ thinking: "hihg" }, undefined, undefined), /BETTER_THINKING/);
 });
 
-test("the helper may only call read-only tools", () => {
-	for (const tool of ["read", "grep", "find", "ls", "bash", "powershell"]) assert.equal(helperToolBlock(tool, ["read", "bash"]), undefined);
+test("the helper blocks tools outside its investigation allowlist", () => {
+	for (const tool of ["read", "grep", "glob", "find", "bash"]) assert.equal(helperToolBlock(tool, ["read", "bash"]), undefined);
 	assert.match(helperToolBlock("edit", ["read", "bash", "edit", "write"])!.reason, /edit is off\. Use read, bash\.$/);
-	assert.equal(helperToolBlock("subagent", ["read", "bash"])?.block, true);
+	assert.equal(helperToolBlock("task", ["read", "bash"])?.block, true);
 });

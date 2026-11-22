@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Ported the extension to OMP, using the `@smol` model role for background rewrites.
+- Added OMP task-brief support and documented the helper's unsandboxed shell.
+
 ## [0.2.0] - 2026-11-13
 
 ### Highlights

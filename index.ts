@@ -1,10 +1,11 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join } from "node:path";
 import type { Readable } from "node:stream";
-import type { ExtensionAPI, ExtensionContext, JsonAgentSessionEvent, SessionEntry, SessionHeader, Theme } from "@earendil-works/pi-coding-agent";
-import { getKeybindings, isKeyRelease, Loader, type TUI, type TuiAltScreen, type TuiMainScreen, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI, ExtensionContext, AgentSessionEvent, SessionEntry, SessionHeader, Theme } from "@oh-my-pi/pi-coding-agent";
+import { getKeybindings, isKeyRelease, Loader, type TUI, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { BRIEF_MARK, buildBriefTask, buildHelperTask, HELPER_ENV, helperExitError, helperModelArgs, helperToolBlock, parseMarkedPrompt, replyProgress } from "./better.ts";
 
 const HELPER_TIMEOUT_MS = 20 * 60 * 1000;
@@ -14,25 +15,26 @@ const SHUTDOWN = "session shutdown";
 
 class Cancelled extends Error {}
 
-type HelperEvent = JsonAgentSessionEvent | SessionHeader;
+type HelperEvent = AgentSessionEvent | SessionHeader;
 
 function askHelper(cwd: string, sessionFile: string | undefined, modelArgs: string[], task: string, signal: AbortSignal, onEvent: (event: HelperEvent) => void): Promise<string> {
-	// The fork goes to a temp dir so it never shows up in /resume.
-	const sessionDir = sessionFile && mkdtempSync(join(tmpdir(), "pi-better-"));
+	const sessionDir = sessionFile && mkdtempSync(join(tmpdir(), "omp-better-"));
 	const cleanUp = () => sessionDir && rmSync(sessionDir, { recursive: true, force: true });
+	if (signal.aborted) {
+		cleanUp();
+		return Promise.reject(new Cancelled());
+	}
 	const args = [
 		"--mode", "json", "-p",
-		...(sessionDir ? ["--fork", sessionFile, "--session-dir", sessionDir] : ["--no-session"]),
-		// No --tools, --no-skills or extra system prompt: any of them can change the request's start and miss the cache.
+		...(sessionDir ? ["--fork", sessionFile!, "--session-dir", sessionDir] : ["--no-session"]),
+		"-e", fileURLToPath(import.meta.url),
 		...modelArgs,
 		task,
 	];
-	// Same launch as Pi's subagent example (getPiInvocation). A Bun-compiled pi runs from /$bunfs/root/ and is
-	// its own executable.
 	const script = process.argv[1];
 	const [command, ...prefix] =
 		script && !script.startsWith("/$bunfs/root/") && existsSync(script) ? [process.execPath, script]
-		: /^(node|bun)(\.exe)?$/.test(basename(process.execPath).toLowerCase()) ? ["pi"]
+		: /^(node|bun)(\.exe)?$/.test(basename(process.execPath).toLowerCase()) ? ["omp"]
 		: [process.execPath];
 	let child: ChildProcessByStdio<null, Readable, Readable>;
 	try {
@@ -60,6 +62,7 @@ function askHelper(cwd: string, sessionFile: string | undefined, modelArgs: stri
 			} catch {}
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
 		child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
 			const lines = (buffered + chunk).split("\n");
 			buffered = lines.pop()!;
@@ -88,7 +91,7 @@ function askHelper(cwd: string, sessionFile: string | undefined, modelArgs: stri
 			if (error) reject(error);
 			else resolve(reply);
 		};
-		child.on("error", (error) => settle(new Error(`Couldn't start pi for the helper: ${error.message}`)));
+		child.on("error", (error) => settle(new Error(`Couldn't start omp for the helper: ${error.message}`)));
 		child.on("close", (code, exitSignal) => {
 			if (signal.aborted) return settle(new Cancelled());
 			if (timedOut) return settle(new Error(`The helper timed out after ${HELPER_TIMEOUT_MS / 60_000} minutes`));
@@ -137,7 +140,7 @@ export class HelperProgress extends Loader {
 	private reply = "";
 
 	constructor(tui: TUI, theme: Theme, projectDirs: readonly string[], startedAt: number) {
-		super(tui, (cell) => cell, (message) => message, "", { frames: ["▰", "▱"], intervalMs: 400 });
+		super(tui, (cell) => cell, (message) => message, "", ["▰", "▱"]);
 		this.theme = theme;
 		this.projectDirs = projectDirs;
 		this.startedAt = startedAt;
@@ -160,7 +163,8 @@ export class HelperProgress extends Loader {
 		const { theme } = this;
 		const { answered, writingPrompt } = replyProgress(this.reply);
 		const stage = writingPrompt ? 5 : answered;
-		const cells = [0, 1, 2, 3, 4, 5].map((i) => (i < stage ? theme.fg("accent", "▰") : i === stage ? theme.fg("accent", this.getRenderedIndicator()) : theme.fg("dim", "▱")));
+		const indicator = Math.floor((Date.now() - this.startedAt) / 400) % 2 ? "▱" : "▰";
+		const cells = [0, 1, 2, 3, 4, 5].map((i) => (i < stage ? theme.fg("accent", "▰") : i === stage ? theme.fg("accent", indicator) : theme.fg("dim", "▱")));
 		const meter = ` ${cells.join("")}  `;
 		const [full, short] =
 			writingPrompt ? [theme.fg("accent", "Writing your improved prompt"), theme.fg("accent", "Writing prompt")]
@@ -174,13 +178,13 @@ export class HelperProgress extends Loader {
 		const pad = " ".repeat(Math.max(0, "/better-cancel".length - cancel.length));
 		const right = `${pad}${theme.fg("muted", clock.padStart(7))}${theme.fg("dim", ` · ${cancel}`)} `;
 		const room = width - visibleWidth(right) - 1;
-		const left = visibleWidth(meter + full) <= room ? meter + full : truncateToWidth(meter + short, room, "…");
+		const left = visibleWidth(meter + full) <= room ? meter + full : truncateToWidth(meter + short, room);
 		const top = left + " ".repeat(Math.max(1, room + 1 - visibleWidth(left))) + right;
 
 		const failed = this.tools.filter((tool) => tool.state === "failed").length;
 		const count = `${this.tools.length} tool${this.tools.length === 1 ? "" : "s"}${failed ? ` · ${failed} failed` : ""}`;
 		const chip = ({ label, state }: (typeof this.tools)[number]) => {
-			const text = truncateToWidth(label, 28, "…");
+			const text = truncateToWidth(label, 28);
 			if (state === "running") return `${theme.fg("muted", "•")} ${text}`;
 			return `${state === "ok" ? theme.fg("success", "✓") : theme.fg("error", "✗")} ${theme.fg("muted", text)}`;
 		};
@@ -193,10 +197,10 @@ export class HelperProgress extends Loader {
 				if (visibleWidth([next, ...shown].join("  ")) > space) break;
 				shown.unshift(next);
 			}
-			const trail = shown.length ? shown.join("  ") : truncateToWidth(chip(this.tools.at(-1)!), Math.max(space, 0), "…");
+			const trail = shown.length ? shown.join("  ") : truncateToWidth(chip(this.tools.at(-1)!), Math.max(space, 0));
 			bottom = `   ${trail}${" ".repeat(Math.max(1, space + 2 - visibleWidth(trail)))}${theme.fg("dim", count)} `;
 		}
-		return [truncateToWidth(top, width, "…"), truncateToWidth(bottom, width, "…")];
+		return [truncateToWidth(top, width), truncateToWidth(bottom, width)];
 	}
 
 	dispose(): void {
@@ -241,43 +245,54 @@ export default function (pi: ExtensionAPI) {
 	let helperRun: AbortController | undefined;
 	// Aborted on session_shutdown: Pi exits or loads a fresh copy of this extension after it, and a helper still
 	// checking a brief would outlive the session.
-	const briefRuns = new AbortController();
+	let briefRuns = new AbortController();
 	let briefsChecking = 0;
 	let boomerangRunning = false;
 
 	if (process.env[HELPER_ENV]) pi.on("tool_call", (event) => helperToolBlock(event.toolName, pi.getActiveTools()));
-	// A subagent brief that starts with "/better" is checked on a copy of this chat before the subagent starts, the
-	// way /better works on a person's prompt. pi-subagents offers each workflow child (scripts, parallel, tasks and
-	// chain, after {previous} is filled in) as its own subagent_launch call; a single child is the subagent call.
-	// Throwing blocks that start, so a failure or Esc never sends the subagent the unchecked brief.
 	else pi.on("tool_call", async (event, ctx) => {
-		const input = event.input as { agent?: unknown; task?: unknown; cwd?: unknown; action?: unknown; resume?: unknown };
-		const single = event.toolName === "subagent" && typeof input.agent === "string" && input.action === undefined;
-		if (!(single || event.toolName === "subagent_launch") || input.resume !== undefined) return;
-		if (typeof input.task !== "string" || !BRIEF_MARK.test(input.task)) return;
-		const brief = input.task.replace(BRIEF_MARK, "").trim();
-		if (!brief) throw new Error("A /better subagent brief needs the brief after /better.");
-		const signal = ctx.signal ? AbortSignal.any([ctx.signal, briefRuns.signal]) : briefRuns.signal;
+		if (event.toolName !== "task") return;
+		const input = event.input as { task?: unknown; tasks?: unknown };
+		const items = Array.isArray(input.tasks) ? input.tasks : [input];
+		const marked = items.filter((item): item is Record<string, unknown> =>
+			typeof item === "object" && item !== null && typeof item.task === "string" && BRIEF_MARK.test(item.task));
+		if (!marked.length) return;
+		const controller = briefRuns;
+		const group = new AbortController();
+		const signal = AbortSignal.any([controller.signal, group.signal]);
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		const fork = sessionFile !== undefined && existsSync(sessionFile) ? sessionFile : undefined;
 		const showCount = () => ctx.ui.setStatus(BRIEF_STATUS, briefsChecking ? `/better is checking ${briefsChecking} subagent brief${briefsChecking === 1 ? "" : "s"}` : undefined);
-		briefsChecking++;
+		briefsChecking += marked.length;
 		showCount();
 		try {
-			const modelArgs = helperModelArgs((pi.getSettings() as { better?: unknown }).better, ctx.model && `${ctx.model.provider}/${ctx.model.id}`, ctx.thinkingLevel);
-			// The helper works where the subagent will, so the paths it checks are the subagent's.
-			const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
-			const reply = await askHelper(cwd, fork, modelArgs, buildBriefTask(briefCheck(), brief), signal, () => {});
-			const checked = parseMarkedPrompt(reply);
-			pi.appendEntry("better", { prompt: brief, improved: checked, reply, subagent: true });
-			input.task = checked;
+			const modelArgs = helperModelArgs({ model: process.env.BETTER_MODEL, thinking: process.env.BETTER_THINKING }, undefined, undefined);
+			const replacements = await Promise.all(marked.map(async item => {
+				const brief = (item.task as string).replace(BRIEF_MARK, "").trim();
+				if (!brief) throw new Error("A /better subagent brief needs the brief after /better.");
+				const reply = await askHelper(ctx.cwd, fork, modelArgs, buildBriefTask(briefCheck(), brief), signal, () => {});
+				const checked = parseMarkedPrompt(reply);
+				return { item, brief, checked, reply };
+			}));
+			for (const { brief, checked, reply } of replacements) pi.appendEntry("better", { prompt: brief, improved: checked, reply, subagent: true });
+			const updates = new Map(replacements.map(({ item, checked }) => [item, { ...item, task: checked }]));
+			return { input: Array.isArray(input.tasks) ? { ...input, tasks: input.tasks.map(item => updates.get(item) ?? item) } : updates.get(input)! };
 		} catch (error) {
+			group.abort();
 			if (error instanceof Cancelled) throw new Error("/better was cancelled, so the subagent didn't start.");
 			throw new Error(`/better couldn't check this subagent brief, so the subagent didn't start: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
-			briefsChecking--;
-			if (briefRuns.signal.reason !== SHUTDOWN) showCount();
+			briefsChecking -= marked.length;
+			if (controller.signal.reason !== SHUTDOWN) showCount();
 		}
+	});
+
+	pi.on("session_before_switch", (_event, ctx) => {
+		briefRuns.abort(SHUTDOWN);
+		briefRuns = new AbortController();
+		helperRun?.abort(SHUTDOWN);
+		ctx.ui.setWidget(WIDGET, undefined);
+		ctx.ui.setStatus(BRIEF_STATUS, undefined);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
@@ -289,7 +304,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("better", {
-		description: "Deepen a prompt (or the current task) with a read-only helper in the background, then put the improved prompt in your input box",
+		description: "Deepen a prompt (or the current task) with a helper in the background, then put the improved prompt in your input box",
 		getArgumentCompletions: promptCompletions,
 		handler: async (args, ctx) => {
 			const prompt = args.trim();
@@ -307,8 +322,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			let modelArgs: string[];
 			try {
-				const chatModel = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
-				modelArgs = helperModelArgs((pi.getSettings() as { better?: unknown }).better, chatModel, ctx.thinkingLevel);
+				modelArgs = helperModelArgs({ model: process.env.BETTER_MODEL, thinking: process.env.BETTER_THINKING }, undefined, undefined);
 			} catch (error) {
 				return failed(ctx, "better", error);
 			}
@@ -321,10 +335,9 @@ export default function (pi: ExtensionAPI) {
 			let stopListening: (() => void) | undefined;
 			if (ctx.mode === "tui") {
 				const startedAt = Date.now();
-				// Pi's two screens, which both track focus; the TUI interface widgets get doesn't expose it.
-				let tui: TuiMainScreen | TuiAltScreen | undefined;
+				let tui: TUI | undefined;
 				ctx.ui.setWidget(WIDGET, (ui, theme) => {
-					tui = ui as TuiMainScreen | TuiAltScreen;
+					tui = ui;
 					return (widget = new HelperProgress(ui, theme, projectDirs, startedAt));
 				});
 				// The first Esc Pi's input box passes on cancels /better; after that, Esc is Pi's again (stopping the agent,
@@ -334,9 +347,8 @@ export default function (pi: ExtensionAPI) {
 					// Kitty terminals also report Esc's release, which Pi drops before the editor. A release, or a second Esc
 					// in the same chunk, arrives before the microtask restore below, so it must not swap again.
 					if (swapped || run.signal.aborted || isKeyRelease(data) || !getKeybindings().matches(data, "app.interrupt")) return;
-					const editor = tui?.getFocusedComponent() as { onEscape?: () => void } | null | undefined;
-					// Pi's editors have actionHandlers; a picker or dialog in focus keeps its own Esc.
-					if (!editor || !("actionHandlers" in editor)) return;
+					const editor = tui?.getFocused();
+					if (!editor || !("onEscape" in editor) || !("setText" in editor)) return;
 					// The key still reaches the editor, which keeps Esc for itself when autocomplete or a vim mode needs it.
 					// Only the Esc it passes on to Pi goes to /better, and only for this key press.
 					swapped = true;
@@ -408,8 +420,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			boomerangRunning = true;
+			const sessionId = ctx.sessionManager.getSessionId();
 			try {
 				await ctx.waitForIdle();
+				if (ctx.sessionManager.getSessionId() !== sessionId) return;
 				// navigateTree to a user or custom message moves to its parent and refills the input box with its text,
 				// so the branch point must be another kind of entry; add an invisible one when the leaf isn't.
 				const leaf = ctx.sessionManager.getLeafEntry();
@@ -421,6 +435,7 @@ export default function (pi: ExtensionAPI) {
 				// triggerTurn starts the turn right away, so waitForIdle waits for it.
 				pi.sendMessage({ customType: "better-boomerang", content: buildHelperTask(helper(), prompt), display: false }, { triggerTurn: true });
 				await ctx.waitForIdle();
+				if (ctx.sessionManager.getSessionId() !== sessionId) return;
 
 				const branch = ctx.sessionManager.getBranch();
 				const start = branch.findIndex((entry) => entry.id === branchPoint);
