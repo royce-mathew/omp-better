@@ -6,10 +6,10 @@ This is an OMP port of [pi-better](https://github.com/nicobailon/pi-better), bui
 
 ## Install
 
-Clone this repository, then install the local package:
+Install from npm:
 
 ```bash
-omp install /path/to/omp-better
+omp install npm:omp-better
 ```
 
 Run `/reload` or restart OMP. The helper explicitly loads the extension, including when the parent loads it with `-e`.
